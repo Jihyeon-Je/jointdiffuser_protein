@@ -505,7 +505,8 @@ def parse_bond(coords):
     Bond angle matrix has order N-CA-C, CA-C-O, CA-C-N, O-C-N
     """
     bb_atoms = ['N', 'CA', 'C', 'O']
-    coords = np.stack(coords).reshape((-1, 4, 3))
+    coords = np.transpose(np.stack(coords), (1,2,0))
+    #coords = np.stack(coords).reshape((-1, 4, 3))
     nres = coords.shape[0]
     
     bond_lengths = np.zeros((nres, 4, 2, 3))

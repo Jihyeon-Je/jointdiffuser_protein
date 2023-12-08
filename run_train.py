@@ -5,7 +5,7 @@ from datasets import get_dataset
 from torchvision.utils import make_grid, save_image
 import utils
 import einops
-from torch.uatils._pytree import tree_map
+from torch.utils._pytree import tree_map
 import accelerate
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -18,12 +18,78 @@ import os
 import wandb
 import libs.autoencoder
 import numpy as np
+import ml_collections
 
+def d(**kwargs):
+    """Helper of creating a config dict."""
+    return ml_collections.ConfigDict(initial_dictionary=kwargs)
+    
+config = ml_collections.ConfigDict()
+config.seed = 1234
+config.z_shape = (3, 1296, 4)
+config.config_name = 'test'
+config.ckpt_root = '/home/users/jihyeonj/jointdiffuser_protein/test/'
+config.sample_dir = '/home/users/jihyeonj/jointdiffuser_protein/test/'
+config.workdir = '/home/users/jihyeonj/jointdiffuser_protein/test/'
+config.hparams = 'default'
+
+config.autoencoder = d(
+    pretrained_path='assets/stable-diffusion/autoencoder_kl.pth',
+    scale_factor=0.23010
+)
+config.train = d(
+    n_steps=50,
+    batch_size=2,
+    log_interval=10,
+    eval_interval=5,
+    save_interval=5
+)
+
+config.optimizer = d(
+    name='adamw',
+    lr=0.0002,
+    weight_decay=0.03,
+    betas=(0.9, 0.9)
+)
+
+config.lr_scheduler = d(
+    name='customized',
+    warmup_steps=5000
+)
+
+config.nnet = d(
+    name='uvit_t2i',
+    img_size=1296,
+    in_chans=3,
+    patch_size=4,
+    embed_dim=100,
+    depth=12,
+    num_heads=10,
+    mlp_ratio=4,
+    qkv_bias=False,
+    mlp_time_embed=False,
+    clip_dim=19,
+    num_clip_token=77
+)
+
+config.dataset = d(
+    name='ligprot_features',
+    path='/scratch/users/jihyeonj/processesd/',
+    cfg=False,
+    p_uncond=0.1
+)
+
+config.sample = d(
+    sample_steps=2,
+    n_samples=10,
+    mini_batch_size=1,
+    cfg=False,
+    scale=1.,
+    path='/home/jihyeonj/unidiffuser/test/res/'
+)
 
 def stable_diffusion_beta_schedule(linear_start=0.00085, linear_end=0.0120, n_timestep=1000):
-    _betas = (
-        torch.linspace(linear_start ** 0.5, linear_end ** 0.5, n_timestep, dtype=torch.float64) ** 2
-    )
+    _betas = (torch.linspace(linear_start ** 0.5, linear_end ** 0.5, n_timestep, dtype=torch.float64) ** 2)
     return _betas.numpy()
 
 
@@ -49,12 +115,14 @@ def stp(s, ts: torch.Tensor):  # scalar tensor product
 def mos(a, start_dim=1):  # mean of square
     return a.pow(2).flatten(start_dim=start_dim).mean(dim=-1)
 
+def LSimple(x0, y0, nnet, schedule, **kwargs):
+    n, eps_x, eps_y, xn, yn = schedule.sample(x0, y0)  # n in {1, ..., 1000}
+    #n= timestep
+    eps_pred_prot, eps_pred_lig = nnet(xn, n, n, yn)
 
-def LSimple(x0, nnet, schedule, **kwargs):
-    n, eps, xn = schedule.sample(x0)  # n in {1, ..., 1000}
-    eps_pred = nnet(xn, n, **kwargs)
-    return mos(eps - eps_pred)
-
+    mos_p = mos(eps_x - eps_pred_prot)
+    mos_l = mos(eps_y - eps_pred_lig)
+    return mos_p + mos_l
 
 
 class Schedule(object):  # discrete time
@@ -82,23 +150,37 @@ class Schedule(object):  # discrete time
     def tilde_beta(self, s, t):
         return self.skip_betas[s, t] * self.cum_betas[s] / self.cum_betas[t]
 
-    def sample(self, x0):  # sample from q(xn|x0), where n is uniform
+    def sample(self, x0, y0):  # 
         n = np.random.choice(list(range(1, self.N + 1)), (len(x0),))
-        eps = torch.randn_like(x0)
-        xn = stp(self.cum_alphas[n] ** 0.5, x0) + stp(self.cum_betas[n] ** 0.5, eps)
-        return torch.tensor(n, device=x0.device), eps, xn
+        eps_x = torch.randn_like(x0)
+        eps_y = torch.randn_like(y0)
+        xn = stp(self.cum_alphas[n] ** 0.5, x0) + stp(self.cum_betas[n] ** 0.5, eps_x)
+        yn = stp(self.cum_alphas[n] ** 0.5, y0) + stp(self.cum_betas[n] ** 0.5, eps_y)
+        return torch.tensor(n, device=x0.device), eps_x, eps_y, xn, yn
 
     def __repr__(self):
         return f'Schedule({self.betas[:10]}..., {self.N})'
 
+def combine_joint(z, text):
+    z = einops.rearrange(z, 'B C H W -> B (C H W)')
+    text = einops.rearrange(text, 'B L D -> B (L D)')
+    return torch.concat([z, text], dim=-1)
+
+def split_joint(x):
+    C, H, W = 3, 1296, 4
+    z_dim = C * H * W
+    z, text = x.split([z_dim, 100 * 19], dim=1)
+    z = einops.rearrange(z, 'B (C H W) -> B C H W', C=C, H=H, W=W)
+    text = einops.rearrange(text, 'B (L D) -> B L D', L=100, D=19)
+    return z, text
 
 
-def train(config):
-    if config.get('benchmark', False):
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
+def main(config):
+#    if config.get('benchmark', False):
+#        torch.backends.cudnn.benchmark = True
+#        torch.backends.cudnn.deterministic = False
 
-    mp.set_start_method('spawn')
+    #mp.set_start_method('spawn')
     accelerator = accelerate.Accelerator()
     device = accelerator.device
     accelerate.utils.set_seed(config.seed, device_specific=True)
@@ -115,7 +197,9 @@ def train(config):
         os.makedirs(config.sample_dir, exist_ok=True)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        wandb.init(dir=os.path.abspath(config.workdir), project=f'uvit_{config.dataset.name}', config=config.to_dict(),
+        wandb.login()
+
+        wandb.init(project='jointdiff-train', config=config.to_dict(),
                    name=config.hparams, job_type='train', mode='offline')
         utils.set_logger(log_level='info', fname=os.path.join(config.workdir, 'output.log'))
         logging.info(config)
@@ -125,13 +209,13 @@ def train(config):
     logging.info(f'Run on {accelerator.num_processes} devices')
 
     dataset = get_dataset(**config.dataset)
-    assert os.path.exists(dataset.fid_stat)
+    #assert os.path.exists(dataset.fid_stat)
     train_dataset = dataset.get_split(split='train', labeled=True)
     train_dataset_loader = DataLoader(train_dataset, batch_size=mini_batch_size, shuffle=True, drop_last=True,
-                                      num_workers=8, pin_memory=True, persistent_workers=True)
+                                      num_workers=1, pin_memory=True, persistent_workers=True)
     test_dataset = dataset.get_split(split='test', labeled=True)  # for sampling
     test_dataset_loader = DataLoader(test_dataset, batch_size=config.sample.mini_batch_size, shuffle=True, drop_last=True,
-                                     num_workers=8, pin_memory=True, persistent_workers=True)
+                                     num_workers=1, pin_memory=True, persistent_workers=True)
 
     train_state = utils.initialize_train_state(config, device)
     nnet, nnet_ema, optimizer, train_dataset_loader, test_dataset_loader = accelerator.prepare(
@@ -139,16 +223,6 @@ def train(config):
     lr_scheduler = train_state.lr_scheduler
     train_state.resume(config.ckpt_root)
 
-    autoencoder = libs.autoencoder.get_model(**config.autoencoder)
-    autoencoder.to(device)
-
-    @ torch.cuda.amp.autocast()
-    def encode(_batch):
-        return autoencoder.encode(_batch)
-
-    @ torch.cuda.amp.autocast()
-    def decode(_batch):
-        return autoencoder.decode(_batch)
 
     def get_data_generator():
         while True:
@@ -160,27 +234,30 @@ def train(config):
     def get_context_generator():
         while True:
             for data in test_dataset_loader:
-                _, _context = data
-                yield _context
+                yield data[0], data[1]
 
     context_generator = get_context_generator()
-
+    
     _betas = stable_diffusion_beta_schedule()
     _schedule = Schedule(_betas)
     logging.info(f'use {_schedule}')
 
-    def cfg_nnet(x, timesteps, context):
-        _cond = nnet_ema(x, timesteps, context=context)
-        _empty_context = torch.tensor(dataset.empty_context, device=device)
-        _empty_context = einops.repeat(_empty_context, 'L D -> B L D', B=x.size(0))
-        _uncond = nnet_ema(x, timesteps, context=_empty_context)
-        return _cond + config.sample.scale * (_cond - _uncond)
+    def joint_nnet(x, timesteps):
+        z, text = split_joint(x)
+        z_out, text_out = nnet(z, t_prot=timesteps, t_lig=timesteps, context = text)
+        if len(z_out.shape)==3:
+            z_out = torch.unsqueeze(z_out, 0)
+            text_out = torch.unsqueeze(text_out, 0)
+        x_out = combine_joint(z_out, text_out)
+
+        return x_out
+
 
     def train_step(_batch):
         _metrics = dict()
         optimizer.zero_grad()
-        _z = autoencoder.sample(_batch[0]) if 'feature' in config.dataset.name else encode(_batch[0])
-        loss = LSimple(_z, nnet, _schedule, context=_batch[1])  # currently only support the extracted feature version
+        
+        loss = LSimple(_batch[0], _batch[1], nnet, _schedule)  # currently only support the extracted feature version
         _metrics['loss'] = accelerator.gather(loss.detach()).mean()
         accelerator.backward(loss.mean())
         optimizer.step()
@@ -188,49 +265,50 @@ def train(config):
         train_state.ema_update(config.get('ema_rate', 0.9999))
         train_state.step += 1
         return dict(lr=train_state.optimizer.param_groups[0]['lr'], **_metrics)
+    
 
-    def dpm_solver_sample(_n_samples, _sample_steps, **kwargs):
+    def sample_fn(_n_samples, sample_steps):
         _z_init = torch.randn(_n_samples, *config.z_shape, device=device)
+        _t_init = torch.randn(_n_samples, *(100,19), device=device)
+        _x_init = combine_joint(_z_init, _t_init)
         noise_schedule = NoiseScheduleVP(schedule='discrete', betas=torch.tensor(_betas, device=device).float())
 
         def model_fn(x, t_continuous):
             t = t_continuous * _schedule.N
-            return cfg_nnet(x, t, **kwargs)
+            return joint_nnet(_x_init, t)
 
         dpm_solver = DPM_Solver(model_fn, noise_schedule, predict_x0=True, thresholding=False)
-        _z = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1.)
-        return decode(_z)
+        _z = dpm_solver.sample(_x_init, steps=sample_steps, eps=1. / _schedule.N, T=1.)
+        prot, lig = split_joint(_z)
+        return prot, lig
 
+    
     def eval_step(n_samples, sample_steps):
         logging.info(f'eval_step: n_samples={n_samples}, sample_steps={sample_steps}, algorithm=dpm_solver, '
                      f'mini_batch_size={config.sample.mini_batch_size}')
 
-        def sample_fn(_n_samples):
-            _context = next(context_generator)
-            assert _context.size(0) == _n_samples
-            return dpm_solver_sample(_n_samples, sample_steps, context=_context)
-
+        _z, _text = sample_fn(n_samples, sample_steps)
         with tempfile.TemporaryDirectory() as temp_path:
             path = config.sample.path or temp_path
             if accelerator.is_main_process:
                 os.makedirs(path, exist_ok=True)
-            utils.sample2dir(accelerator, path, n_samples, config.sample.mini_batch_size, sample_fn, dataset.unpreprocess)
+            utils.sample2dir(accelerator, path, n_samples, config.sample.mini_batch_size, sample_fn, sample_steps, dataset.unpreprocess)
 
-            _fid = 0
+            score = 0
             if accelerator.is_main_process:
-                _fid = calculate_fid_given_paths((dataset.fid_stat, path))
-                logging.info(f'step={train_state.step} fid{n_samples}={_fid}')
+                score = calculate_fid_given_paths((path))
+                logging.info(f'step={train_state.step} eval{n_samples}={score}')
                 with open(os.path.join(config.workdir, 'eval.log'), 'a') as f:
-                    print(f'step={train_state.step} fid{n_samples}={_fid}', file=f)
-                wandb.log({f'fid{n_samples}': _fid}, step=train_state.step)
-            _fid = torch.tensor(_fid, device=device)
-            _fid = accelerator.reduce(_fid, reduction='sum')
+                    print(f'step={train_state.step} score{n_samples}={score}', file=f)
+                wandb.log({f'score{n_samples}': score}, step=train_state.step)
+            score = torch.tensor(score, device=device)
+            #_fid = accelerator.reduce(_fid, reduction='sum')
 
-        return _fid.item()
+        return score
 
     logging.info(f'Start fitting, step={train_state.step}, mixed_precision={config.mixed_precision}')
 
-    step_fid = []
+    step_score = []
     while train_state.step < config.train.n_steps:
         nnet.train()
         batch = tree_map(lambda x: x.to(device), next(data_generator))
@@ -244,14 +322,13 @@ def train(config):
 
         if accelerator.is_main_process and train_state.step % config.train.eval_interval == 0:
             torch.cuda.empty_cache()
-            logging.info('Save a grid of images...')
-            contexts = torch.tensor(dataset.contexts, device=device)[: 2 * 5]
-            samples = dpm_solver_sample(_n_samples=2 * 5, _sample_steps=50, context=contexts)
-            samples = make_grid(dataset.unpreprocess(samples), 5)
-            save_image(samples, os.path.join(config.sample_dir, f'{train_state.step}.png'))
-            wandb.log({'samples': wandb.Image(samples)}, step=train_state.step)
+            #contexts = torch.tensor(dataset.contexts, device=device)[: 2 * 5]
+            #samples = dpm_solver_sample(_n_samples=2 * 5, _sample_steps=50, context=contexts)
+            #samples = make_grid(dataset.unpreprocess(samples), 5)
+            #save_image(samples, os.path.join(config.sample_dir, f'{train_state.step}.png'))
+            #wandb.log({'samples': wandb.Image(samples)}, step=train_state.step)
             torch.cuda.empty_cache()
-        accelerator.wait_for_everyone()
+        #accelerator.wait_for_everyone()
 
         if train_state.step % config.train.save_interval == 0 or train_state.step == config.train.n_steps:
             torch.cuda.empty_cache()
@@ -259,17 +336,21 @@ def train(config):
             if accelerator.local_process_index == 0:
                 train_state.save(os.path.join(config.ckpt_root, f'{train_state.step}.ckpt'))
             accelerator.wait_for_everyone()
-            fid = eval_step(n_samples=10000, sample_steps=50)  # calculate fid of the saved checkpoint
-            step_fid.append((train_state.step, fid))
+            score = eval_step(n_samples=5, sample_steps=5)  # calculate fid of the saved checkpoint
+            step_score.append((train_state.step, score))
             torch.cuda.empty_cache()
-        accelerator.wait_for_everyone()
+        #accelerator.wait_for_everyone()
 
     logging.info(f'Finish fitting, step={train_state.step}')
-    logging.info(f'step_fid: {step_fid}')
-    step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
+    logging.info(f'step_score: {step_score}')
+    step_best = sorted(step_score, key=lambda x: x[1])[0][0]
     logging.info(f'step_best: {step_best}')
     train_state.load(os.path.join(config.ckpt_root, f'{step_best}.ckpt'))
     del metrics
-    accelerator.wait_for_everyone()
+    #accelerator.wait_for_everyone()
     eval_step(n_samples=config.sample.n_samples, sample_steps=config.sample.sample_steps)
 
+
+
+if __name__ == "__main__":
+    main(config)
